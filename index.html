@@ -1,0 +1,128 @@
+  <!DOCTYPE html>                                                                                                                              
+  <html lang="en">
+  <head>
+  <meta charset="UTF-8">
+  <title>Scatter</title>
+  <style>
+  :root {                                                                                                                                      
+    --bg: #0a0a0a;
+    --fg: #e5e5e5;                                                                                                                             
+    --dim: #5a5a5a;
+    --amber: #ffb800;
+    --green: #00ff88;                                                                                                                          
+    --err: #ff6b6b;
+  }                                                                                                                                            
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: var(--bg); color: var(--fg);                                                                                                   
+    font-family: "Victor Mono", "JetBrains Mono", ui-monospace, monospace;
+    height: 100vh; overflow: hidden;                                                                                                           
+  }                                                                                                                                            
+  body { display: flex; flex-direction: column; padding: 24px; gap: 16px; }
+  header {                                                                                                                                     
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding-bottom: 12px; border-bottom: 1px solid var(--dim);                                                                                 
+  }
+  header h1 { font-size: 14px; font-weight: normal; letter-spacing: 2px; }                                                                     
+  header .ipw { font-size: 11px; color: var(--dim); }                                                                                          
+  main { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding-right: 8px; }
+  .call { border-left: 2px solid var(--dim); padding-left: 12px; }                                                                             
+  .call .meta { font-size: 11px; color: var(--dim); display: flex; gap: 12px; }                                                                
+  .call .route { text-transform: uppercase; letter-spacing: 1px; }                                                                             
+  .call [data-route="cloud:sonnet"] { color: var(--amber); }                                                                                   
+  .call [data-route="local:qwen"], .call [data-route="local:launch"] { color: var(--green); }
+  .call [data-route="local:shell"] { color: var(--dim); }                                                                                      
+  .call .message { margin-top: 4px; color: var(--fg); }
+  .call .response { margin-top: 4px; white-space: pre-wrap; color: var(--fg); font-size: 13px; }                                               
+  .call.err .meta span { color: var(--err); }                                                                                                  
+  form { display: flex; gap: 12px; align-items: center; border-top: 1px solid var(--dim); padding-top: 16px; }                                 
+  input[type=text] {                                                                                                                           
+    flex: 1; background: transparent; border: none; color: var(--fg);                                                                          
+    font-family: inherit; font-size: 14px; font-style: italic; outline: none;                                                                  
+  }               
+  input[type=text]::placeholder { color: var(--dim); font-style: italic; }                                                                     
+  button {                                                                                                                                     
+    background: transparent; border: 1px solid var(--amber); color: var(--amber);
+    font-family: inherit; font-size: 12px; padding: 8px 16px; cursor: pointer;                                                                 
+    letter-spacing: 1px;
+  }                                                                                                                                            
+  .local-toggle { font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  </style>                                                                                                                                     
+  </head>         
+  <body>                                                                                                                                       
+  <header>
+    <h1>SCATTER</h1>                                                                                                                           
+    <div class="ipw" id="ipw">loading...</div>
+  </header>
+  <main id="stream"></main>
+  <form id="form">
+    <input type="text" id="input" placeholder="talk to scatter — launch, edit, ask, teach" autofocus autocomplete="off">                       
+    <label class="local-toggle"><input type="checkbox" id="prefer-local">local only</label>
+    <button type="submit">send</button>                                                                                                        
+  </form>         
+  <script>                                                                                                                                     
+  const stream = document.getElementById('stream');
+  const form = document.getElementById('form');                                                                                                
+  const input = document.getElementById('input');
+  const preferLocal = document.getElementById('prefer-local');                                                                                 
+  const ipwEl = document.getElementById('ipw');
+                                                                                                                                               
+  async function refreshIpw() {
+    try {                                                                                                                                      
+      const r = await fetch('/ipw-summary');
+      const d = await r.json();
+      ipwEl.textContent = `${d.tokens} tokens · ${d.watt_hours.toFixed(3)} Wh · ${d.calls} calls (24h)`;
+    } catch (e) { ipwEl.textContent = 'ipw offline'; }                                                                                         
+  }                                                                                                                                            
+                                                                                                                                               
+  function render(call, response) {                                                                                                            
+    const el = document.createElement('div');
+    el.className = 'call';
+    el.innerHTML = `
+      <div class="meta">                                                                                                                       
+        <span class="route" data-route="${response.route}">${response.route}</span>
+        <span>${response.tokens} tokens</span>                                                                                                 
+        <span>${response.ms}ms</span>                                                                                                          
+      </div>
+      <div class="message">&gt; ${call}</div>                                                                                                  
+      <div class="response"></div>
+    `;
+    el.querySelector('.response').textContent = response.response;                                                                             
+    stream.appendChild(el);
+    stream.scrollTop = stream.scrollHeight;                                                                                                    
+  }               
+
+  form.addEventListener('submit', async (e) => {                                                                                               
+    e.preventDefault();
+    const message = input.value.trim();                                                                                                        
+    if (!message) return;
+    input.value = '';
+    const pending = document.createElement('div');
+    pending.className = 'call';                                                                                                                
+    pending.innerHTML = `<div class="meta"><span>routing…</span></div><div class="message">&gt; ${message}</div>`;
+    stream.appendChild(pending);                                                                                                               
+    stream.scrollTop = stream.scrollHeight;
+    try {                                                                                                                                      
+      const r = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },                                                                                       
+        body: JSON.stringify({ message, prefer_local: preferLocal.checked }),
+      });                                                                                                                                      
+      const d = await r.json();
+      pending.remove();                                                                                                                        
+      render(message, d);
+      refreshIpw();                                                                                                                            
+    } catch (err) {
+      pending.remove();
+      const errEl = document.createElement('div');
+      errEl.className = 'call err';                                                                                                            
+      errEl.innerHTML = `<div class="meta"><span>error</span></div><div class="response">${err.message}</div>`;
+      stream.appendChild(errEl);                                                                                                               
+    }                                                                                                                                          
+  });
+                                                                                                                                               
+  refreshIpw();   
+  setInterval(refreshIpw, 10000);
+  </script>
+  </body>
+  </html>
