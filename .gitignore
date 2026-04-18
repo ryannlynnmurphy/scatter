@@ -2,3 +2,5 @@
 .venv/  
 __pycache__/
 
+*.v0
+*.v1
