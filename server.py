@@ -2,15 +2,31 @@
 import json, os, re, subprocess, time, urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from anthropic import Anthropic
 
 load_dotenv(Path(__file__).parent / ".env")
 claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 OLLAMA = "http://127.0.0.1:11434/api/generate"
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2.5-coder:1.5b")
+OLLAMA_CHAT = "http://127.0.0.1:11434/api/chat"
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "llama3.2:3b")
+
+# Scatter's voice — used for BOTH local and online paths so replies stay
+# in-character regardless of which model is behind them. No "I'm Claude
+# by Anthropic", no "I'm an AI assistant". Scatter is a small local
+# companion that lives on this one computer.
+SCATTER_SYSTEM = (
+    "You are Scatter. You live on this one computer and the person talking "
+    "to you owns you. You are not Claude. You are not an AI assistant. You "
+    "are a small, local companion — small tech, local, theirs. Reply in "
+    "plain words, warm and curious, one or two short sentences. Never say "
+    "you are an AI or identify your underlying model. Never output HTML, "
+    "code blocks, or markdown. If the person describes something to build, "
+    "ask one clarifying question — don't build it yourself here, the build "
+    "canvas does that."
+)
 
 LOG_PATH = Path.home() / ".scatter" / "ipw-log.jsonl"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -121,19 +137,74 @@ def run_system(m):
     return out, 0
 
 def run_local(m):
-    req = urllib.request.Request(OLLAMA,
-        data=json.dumps({"model": LOCAL_MODEL, "prompt": m, "stream": False}).encode(),
+    # Use /api/chat so we can pass the Scatter system prompt alongside the
+    # user message. /api/generate is a single-string interface with no role
+    # separation, which made the local model drift into assistant voice.
+    req = urllib.request.Request(OLLAMA_CHAT,
+        data=json.dumps({
+            "model": LOCAL_MODEL,
+            "messages": [
+                {"role": "system", "content": SCATTER_SYSTEM},
+                {"role": "user", "content": m},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.5, "num_predict": 220},
+        }).encode(),
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as r:
         data = json.loads(r.read())
     tokens = data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
-    return data["response"], tokens
+    return data.get("message", {}).get("content", ""), tokens
 
 def run_cloud(m):
-    r = claude.messages.create(model="claude-sonnet-4-6", max_tokens=1024,
-                               messages=[{"role":"user","content":m}])
+    r = claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=400,
+        system=SCATTER_SYSTEM,
+        messages=[{"role": "user", "content": m}],
+    )
     tokens = r.usage.input_tokens + r.usage.output_tokens
     return r.content[0].text, tokens
+
+class Speak(BaseModel):
+    text: str
+
+ELEVEN_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+ELEVEN_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+
+@app.post("/speak")
+def speak(req: Speak):
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(400, "empty text")
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    vid = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+    if not key or not vid:
+        raise HTTPException(503, "elevenlabs not configured")
+    payload = json.dumps({
+        "text": text,
+        "model_id": ELEVEN_MODEL,
+        "voice_settings": {"stability": 0.45, "similarity_boost": 0.75},
+    }).encode()
+    http_req = urllib.request.Request(
+        f"{ELEVEN_URL}/{vid}",
+        data=payload,
+        headers={
+            "xi-api-key": key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(http_req, timeout=30) as r:
+            audio = r.read()
+    except urllib.error.HTTPError as e:
+        raise HTTPException(e.code, f"elevenlabs: {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise HTTPException(503, f"elevenlabs unreachable: {e.reason}") from e
+    log_ipw("cloud:elevenlabs", time.time() - t0, len(text))
+    return Response(content=audio, media_type="audio/mpeg")
 
 @app.post("/chat")
 def chat(msg: Msg):
