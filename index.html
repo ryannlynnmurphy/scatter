@@ -47,6 +47,14 @@
     letter-spacing: 1px;
   }                                                                                                                                            
   .local-toggle { font-size: 11px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .stats { font-size: 11px; color: var(--dim); display: grid; grid-template-columns: 1fr auto auto auto auto; gap: 4px 16px; padding-bottom: 8px; border-bottom: 1px solid var(--dim); }
+  .stats .hdr { color: var(--dim); letter-spacing: 1px; text-transform: uppercase; font-size: 10px; }
+  .stats .route { letter-spacing: 1px; }
+  .stats [data-route="cloud:sonnet"] { color: var(--amber); }
+  .stats [data-route="local:qwen"], .stats [data-route="local:launch"] { color: var(--green); }
+  .stats [data-route="local:shell"] { color: var(--dim); }
+  .stats .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
+  .stats .ipw { color: var(--amber); }
   </style>                                                                                                                                     
   </head>         
   <body>                                                                                                                                       
@@ -54,6 +62,7 @@
     <h1>SCATTER</h1>                                                                                                                           
     <div class="ipw" id="ipw">loading...</div>
   </header>
+  <div class="stats" id="stats"></div>
   <main id="stream"></main>
   <form id="form">
     <input type="text" id="input" placeholder="talk to scatter — launch, edit, ask, teach" autofocus autocomplete="off">                       
@@ -66,13 +75,35 @@
   const input = document.getElementById('input');
   const preferLocal = document.getElementById('prefer-local');                                                                                 
   const ipwEl = document.getElementById('ipw');
+  const statsEl = document.getElementById('stats');
                                                                                                                                                
   async function refreshIpw() {
     try {                                                                                                                                      
       const r = await fetch('/ipw-summary');
       const d = await r.json();
       ipwEl.textContent = `${d.tokens} tokens · ${d.watt_hours.toFixed(3)} Wh · ${d.calls} calls (24h)`;
-    } catch (e) { ipwEl.textContent = 'ipw offline'; }                                                                                         
+    } catch (e) { ipwEl.textContent = 'ipw offline'; }
+  }
+
+  async function refreshStats() {
+    try {
+      const r = await fetch('/stats');
+      const d = await r.json();
+      if (!d.routes.length) { statsEl.innerHTML = ''; return; }
+      const hdr = `
+        <div class="hdr">route</div>
+        <div class="hdr num">calls</div>
+        <div class="hdr num">tokens</div>
+        <div class="hdr num">Ws</div>
+        <div class="hdr num">tok/Ws</div>`;
+      const rows = d.routes.map(r => `
+        <div class="route" data-route="${r.route}">${r.route}</div>
+        <div class="num">${r.calls}</div>
+        <div class="num">${r.tokens}</div>
+        <div class="num">${r.watt_seconds.toFixed(1)}</div>
+        <div class="num ipw">${r.tokens_per_watt_second ?? '—'}</div>`).join('');
+      statsEl.innerHTML = hdr + rows;
+    } catch (e) { statsEl.innerHTML = ''; }
   }                                                                                                                                            
                                                                                                                                                
   function render(call, response) {                                                                                                            
@@ -111,7 +142,8 @@
       const d = await r.json();
       pending.remove();                                                                                                                        
       render(message, d);
-      refreshIpw();                                                                                                                            
+      refreshIpw();
+      refreshStats();                                                                                                                            
     } catch (err) {
       pending.remove();
       const errEl = document.createElement('div');
@@ -121,8 +153,10 @@
     }                                                                                                                                          
   });
                                                                                                                                                
-  refreshIpw();   
+  refreshIpw();
+  refreshStats();
   setInterval(refreshIpw, 10000);
+  setInterval(refreshStats, 10000);
   </script>
   </body>
   </html>

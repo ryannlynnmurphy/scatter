@@ -54,23 +54,66 @@ def ipw_summary():
                     pass
     return {"tokens": tokens, "watt_hours": watt_seconds / 3600, "calls": calls}
 
+@app.get("/stats")
+def stats():
+    cutoff = time.time() - 86400
+    routes = {}
+    if LOG_PATH.exists():
+        with LOG_PATH.open() as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if e.get("timestamp", 0) <= cutoff:
+                        continue
+                    r = routes.setdefault(e["route"], {"calls": 0, "tokens": 0, "watt_seconds": 0.0})
+                    r["calls"] += 1
+                    r["tokens"] += e.get("tokens", 0)
+                    r["watt_seconds"] += e.get("watt_seconds", 0)
+                except Exception:
+                    pass
+    out = []
+    for name, r in routes.items():
+        tok_per_ws = r["tokens"] / r["watt_seconds"] if r["watt_seconds"] > 0 else None
+        out.append({
+            "route": name,
+            "calls": r["calls"],
+            "tokens": r["tokens"],
+            "watt_seconds": round(r["watt_seconds"], 3),
+            "tokens_per_watt_second": round(tok_per_ws, 3) if tok_per_ws is not None else None,
+        })
+    out.sort(key=lambda x: (x["tokens_per_watt_second"] or 0), reverse=True)
+    return {"window": "24h", "routes": out, "note": "watts_estimated_not_metered"}
+
 class Msg(BaseModel):
     message: str
     prefer_local: bool = False
 
-LAUNCH = re.compile(r"^\s*(open|launch|start)\s+(\S+)", re.I)
+LAUNCH_VERB = re.compile(r"\b(open|launch|start|run|show|fire up|pull up|bring up)\b", re.I)
+LAUNCH_TARGETS = {
+    "firefox": "firefox", "browser": "firefox", "web": "firefox",
+    "files": "nautilus", "file manager": "nautilus", "finder": "nautilus",
+    "terminal": "gnome-terminal", "shell": "gnome-terminal", "console": "gnome-terminal",
+}
 SYSQ = re.compile(r"\b(disk|memory|battery|processes|uptime|wifi)\b", re.I)
 
+def _launch_target(m):
+    if not LAUNCH_VERB.search(m): return None
+    lower = m.lower()
+    for key in sorted(LAUNCH_TARGETS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(key)}\b", lower):
+            return LAUNCH_TARGETS[key]
+    return None
+
 def classify(m):
-    if LAUNCH.match(m): return "launch"
+    if _launch_target(m): return "launch"
     if SYSQ.search(m): return "system_query"
     if any(k in m.lower() for k in ("write ", "fix ", "debug ", "refactor ", "code ")): return "code"
     return "chat"
 
 def run_launch(m):
-    app_name = LAUNCH.match(m).group(2)
-    subprocess.Popen([app_name], start_new_session=True)
-    return f"launched {app_name}", 0
+    cmd = _launch_target(m)
+    subprocess.Popen(cmd, shell=True, start_new_session=True)
+    return f"launched {cmd}", 0
 
 def run_system(m):
     out = subprocess.run(["bash","-c","uptime && free -h && df -h /"],
