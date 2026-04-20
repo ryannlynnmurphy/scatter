@@ -29,7 +29,21 @@ SCATTER_SYSTEM = (
 )
 
 LOG_PATH = Path.home() / ".scatter" / "ipw-log.jsonl"
+CHAT_LOG_PATH = Path.home() / ".scatter" / "chats.jsonl"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+def log_chat(user_text: str, reply: str, route: str, ms: int) -> None:
+    """Append a chat exchange to the chat log. Read by the Journal inspector
+    so Ryann can see her conversations without getting the whole database."""
+    entry = {
+        "ts": time.time(),
+        "user": user_text,
+        "reply": reply,
+        "route": route,
+        "ms": ms,
+    }
+    with CHAT_LOG_PATH.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
 WATTS = {"local:shell": 1.0, "local:launch": 0.5, "cloud:sonnet": 5.0, "local:qwen": 30.0}
 
 def log_ipw(route, duration_s, tokens):
@@ -210,11 +224,47 @@ def speak(req: Speak):
 def chat(msg: Msg):
     t0 = time.time()
     intent = classify(msg.message)
+    # Route labels reflect the actual model so the teach-trail doesn't lie.
+    local_label = f"local:{LOCAL_MODEL.split(':')[0]}"
     if intent == "launch":          (resp, tokens), route = run_launch(msg.message), "local:launch"
     elif intent == "system_query":  (resp, tokens), route = run_system(msg.message), "local:shell"
     elif intent == "code":          (resp, tokens), route = run_cloud(msg.message), "cloud:sonnet"
-    elif msg.prefer_local:          (resp, tokens), route = run_local(msg.message), "local:qwen"
+    elif msg.prefer_local:          (resp, tokens), route = run_local(msg.message), local_label
     else:                            (resp, tokens), route = run_cloud(msg.message), "cloud:sonnet"
     duration = time.time() - t0
+    ms = int(duration * 1000)
     log_ipw(route, duration, tokens)
-    return {"response": resp, "route": route, "tokens": tokens, "ms": int(duration * 1000)}
+    # Only log prose exchanges — launches and system queries aren't a chat.
+    if intent not in ("launch", "system_query"):
+        log_chat(msg.message, resp, route, ms)
+    return {"response": resp, "route": route, "tokens": tokens, "ms": ms}
+
+
+class ChatsQuery(BaseModel):
+    limit: int = 100
+
+
+@app.post("/chats/break")
+def chats_break():
+    """Append a session-break marker to the chat log so the Journal can
+    show a divider between conversations. Doesn't erase anything."""
+    entry = {"ts": time.time(), "user": "", "reply": "", "route": "break", "ms": 0}
+    with CHAT_LOG_PATH.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"status": "ok"}
+
+
+@app.get("/chats")
+def chats(limit: int = 100):
+    """Return the last N chat exchanges from the chat log. Used by the
+    Journal inspector to show Ryann her conversations, nothing else."""
+    if not CHAT_LOG_PATH.exists():
+        return {"entries": []}
+    entries = []
+    with CHAT_LOG_PATH.open() as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    return {"entries": entries[-limit:]}
