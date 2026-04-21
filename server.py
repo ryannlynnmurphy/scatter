@@ -32,6 +32,37 @@ LOG_PATH = Path.home() / ".scatter" / "ipw-log.jsonl"
 CHAT_LOG_PATH = Path.home() / ".scatter" / "chats.jsonl"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# Short rolling memory — last N user/assistant pairs seeded into every
+# /chat call so Scatter can reference the prior turn naturally. A
+# session-break marker ("new chat") walls off earlier topics. N=5 ≈ 600
+# tokens, well inside llama3.2:3b's context and trivial for Sonnet.
+HISTORY_TURNS = 5
+
+
+def _recent_history(n_pairs: int = HISTORY_TURNS) -> list:
+    """Return the last n_pairs user/assistant exchanges from the chat log,
+    stopping at a session-break marker. Empty list if no log yet."""
+    if not CHAT_LOG_PATH.exists():
+        return []
+    lines = CHAT_LOG_PATH.read_text().splitlines()[-(n_pairs * 4):]
+    msgs, pairs = [], 0
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except Exception:
+            continue
+        if e.get("route") == "break":
+            break
+        if not e.get("user") and not e.get("reply"):
+            continue
+        msgs.insert(0, {"role": "assistant", "content": e.get("reply", "")})
+        msgs.insert(0, {"role": "user", "content": e.get("user", "")})
+        pairs += 1
+        if pairs >= n_pairs:
+            break
+    return msgs
+
+
 def log_chat(user_text: str, reply: str, route: str, ms: int) -> None:
     """Append a chat exchange to the chat log. Read by the Journal inspector
     so Ryann can see her conversations without getting the whole database."""
@@ -125,6 +156,23 @@ LAUNCH_TARGETS = {
     "terminal": "gnome-terminal", "shell": "gnome-terminal", "console": "gnome-terminal",
 }
 SYSQ = re.compile(r"\b(disk|memory|battery|processes|uptime|wifi)\b", re.I)
+# Retrieval verbs — "what did we talk about," "show me our chat," "remind
+# me what I said." Resolves to a curated bubble, not a window.
+RECALL = re.compile(
+    r"\b("
+    r"what did (we|i|you) \w*\s*(say|talk|discuss|cover|ask|mention)|"
+    r"what('?s| is| was) (my|our) (favorite|favourite|last|previous)|"
+    r"show me (our|the|my) (chat|chats|history|conversation)|"
+    r"remind me (what|of|about)|"
+    r"what (were|was) (we|i) (talking|saying|discussing|asking|doing)|"
+    r"read (that|it) back|"
+    r"(our|my) last (chat|message|conversation|thing)|"
+    r"what was that about|"
+    r"do you remember|"
+    r"what did i (just )?(say|ask)"
+    r")\b",
+    re.I,
+)
 
 def _launch_target(m):
     if not LAUNCH_VERB.search(m): return None
@@ -136,6 +184,7 @@ def _launch_target(m):
 
 def classify(m):
     if _launch_target(m): return "launch"
+    if RECALL.search(m): return "recall"
     if SYSQ.search(m): return "system_query"
     if any(k in m.lower() for k in ("write ", "fix ", "debug ", "refactor ", "code ")): return "code"
     return "chat"
@@ -150,17 +199,65 @@ def run_system(m):
                          capture_output=True, text=True).stdout
     return out, 0
 
-def run_local(m):
-    # Use /api/chat so we can pass the Scatter system prompt alongside the
-    # user message. /api/generate is a single-string interface with no role
-    # separation, which made the local model drift into assistant voice.
+
+RECALL_SYSTEM = (
+    "You are Scatter, looking back over recent conversation with the person "
+    "who owns you. Summarize what you two have been talking about in one "
+    "or two warm, plain sentences — no bullet lists, no 'here's a summary', "
+    "just speak it the way a friend would. If the log is empty, say so "
+    "gently. Never output HTML or code blocks."
+)
+
+
+def run_recall(m, history=None):
+    """Curated summary of recent turns. Returns a single prose bubble that
+    references what was actually said, not a scrollback. The history
+    passed in IS the memory — recall just reflects it back."""
+    turns = history or _recent_history(n_pairs=HISTORY_TURNS)
+    if not turns:
+        return ("We haven't talked about anything yet — say something and I'll remember.", 0)
+    # Render the turns as a compact transcript and ask the local model to
+    # summarize. Use llama for this — keeps it local, cheap, private.
+    transcript_lines = []
+    for turn in turns:
+        who = "you" if turn["role"] == "user" else "me"
+        transcript_lines.append(f"{who}: {turn['content']}")
+    transcript = "\n".join(transcript_lines)
+    prompt = (
+        f"Recent conversation:\n{transcript}\n\n"
+        f"The person just asked: {m!r}\n\n"
+        "Answer in one or two warm, plain sentences."
+    )
     req = urllib.request.Request(OLLAMA_CHAT,
         data=json.dumps({
             "model": LOCAL_MODEL,
             "messages": [
-                {"role": "system", "content": SCATTER_SYSTEM},
-                {"role": "user", "content": m},
+                {"role": "system", "content": RECALL_SYSTEM},
+                {"role": "user", "content": prompt},
             ],
+            "stream": False,
+            "options": {"temperature": 0.4, "num_predict": 180},
+        }).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = json.loads(r.read())
+    tokens = data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
+    return data.get("message", {}).get("content", "").strip(), tokens
+
+def run_local(m, history=None):
+    # Use /api/chat so we can pass the Scatter system prompt alongside the
+    # user message. /api/generate is a single-string interface with no role
+    # separation, which made the local model drift into assistant voice.
+    # History is seeded so Scatter can reference prior turns — "what did I
+    # just say?" works.
+    msgs = [{"role": "system", "content": SCATTER_SYSTEM}]
+    if history:
+        msgs.extend(history)
+    msgs.append({"role": "user", "content": m})
+    req = urllib.request.Request(OLLAMA_CHAT,
+        data=json.dumps({
+            "model": LOCAL_MODEL,
+            "messages": msgs,
             "stream": False,
             "options": {"temperature": 0.5, "num_predict": 220},
         }).encode(),
@@ -170,12 +267,17 @@ def run_local(m):
     tokens = data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
     return data.get("message", {}).get("content", ""), tokens
 
-def run_cloud(m):
+
+def run_cloud(m, history=None):
+    msgs = []
+    if history:
+        msgs.extend(history)
+    msgs.append({"role": "user", "content": m})
     r = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=400,
         system=SCATTER_SYSTEM,
-        messages=[{"role": "user", "content": m}],
+        messages=msgs,
     )
     tokens = r.usage.input_tokens + r.usage.output_tokens
     return r.content[0].text, tokens
@@ -226,11 +328,15 @@ def chat(msg: Msg):
     intent = classify(msg.message)
     # Route labels reflect the actual model so the teach-trail doesn't lie.
     local_label = f"local:{LOCAL_MODEL.split(':')[0]}"
+    # Rolling memory — seeded for prose paths only. Launches and system
+    # queries don't need prior turns.
+    hist = _recent_history() if intent not in ("launch", "system_query") else None
     if intent == "launch":          (resp, tokens), route = run_launch(msg.message), "local:launch"
+    elif intent == "recall":        (resp, tokens), route = run_recall(msg.message, hist), "local:recall"
     elif intent == "system_query":  (resp, tokens), route = run_system(msg.message), "local:shell"
-    elif intent == "code":          (resp, tokens), route = run_cloud(msg.message), "cloud:sonnet"
-    elif msg.prefer_local:          (resp, tokens), route = run_local(msg.message), local_label
-    else:                            (resp, tokens), route = run_cloud(msg.message), "cloud:sonnet"
+    elif intent == "code":          (resp, tokens), route = run_cloud(msg.message, hist), "cloud:sonnet"
+    elif msg.prefer_local:          (resp, tokens), route = run_local(msg.message, hist), local_label
+    else:                            (resp, tokens), route = run_cloud(msg.message, hist), "cloud:sonnet"
     duration = time.time() - t0
     ms = int(duration * 1000)
     log_ipw(route, duration, tokens)
